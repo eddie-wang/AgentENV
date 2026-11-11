@@ -481,10 +481,20 @@ pub struct FirecrackerSnapshotConfig {
 
 impl FirecrackerSnapshotConfig {
     pub fn from_runnable_snapshot(snapshot: &RunnableSnapshot) -> Result<Self> {
+        Self::from_runnable_snapshot_for_backend(snapshot, FIRECRACKER_BACKEND)
+    }
+
+    /// Like [`from_runnable_snapshot`](Self::from_runnable_snapshot), for a
+    /// capture taken by `backend`. The container backend reuses the common
+    /// launch fields (rootfs image, env, workdir, user, tools version).
+    pub(crate) fn from_runnable_snapshot_for_backend(
+        snapshot: &RunnableSnapshot,
+        backend: &str,
+    ) -> Result<Self> {
         let mut base_common =
             FirecrackerCommonConfig::from_global_config().context("load sandbox common config")?;
         let manifest = snapshot.manifest();
-        if manifest.backend != FIRECRACKER_BACKEND {
+        if manifest.backend != backend {
             bail!(
                 "snapshot '{}' was captured by the {} backend, and a capture is restored by \
                  the VMM which took it",

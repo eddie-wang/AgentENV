@@ -452,6 +452,17 @@ impl Slot {
         resolve_guest_dns_server()
     }
 
+    /// Guest side of the slot's VM link: `(guest_ip, gateway_ip, prefix)`.
+    /// A Firecracker guest gets these from the kernel `ip=` boot arg; the
+    /// container backend configures them on its own veth.
+    pub(crate) fn guest_link(&self) -> (Ipv4Addr, Ipv4Addr, u8) {
+        (
+            self.address_plan.vm_ip(),
+            self.address_plan.tap_ip(),
+            self.address_plan.vm_link_prefix(),
+        )
+    }
+
     pub(crate) fn namespace_path(&self) -> std::path::PathBuf {
         self.netns_dir.join(&self.namespace_id)
     }

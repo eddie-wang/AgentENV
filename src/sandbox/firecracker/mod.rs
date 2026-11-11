@@ -26,3 +26,8 @@ pub(super) use instance::FirecrackerInstance;
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox};
 pub(crate) use startup_pack::record_startup_pack;
+// Shared with the container backend, which keeps the same rootfs storage path.
+pub(crate) use overlaybd_snapshot::{
+    build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
+    restack_snapshot_overlaybd_rootfs,
+};

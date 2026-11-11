@@ -10,8 +10,11 @@ pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 /// Name `backend` takes when a record predates the field.
 pub const FIRECRACKER_BACKEND: &str = "firecracker";
 
+/// Name of the OCI container (runc + CRIU) backend.
+pub const CONTAINER_BACKEND: &str = "container";
+
 /// Names a restore knows how to reach a VMM by.
-const KNOWN_BACKENDS: &[&str] = &[FIRECRACKER_BACKEND];
+const KNOWN_BACKENDS: &[&str] = &[FIRECRACKER_BACKEND, CONTAINER_BACKEND];
 
 fn default_backend() -> String {
     FIRECRACKER_BACKEND.to_string()

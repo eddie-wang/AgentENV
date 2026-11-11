@@ -569,7 +569,7 @@ async fn capture_live_overlaybd_snapshot(
     Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
 }
 
-pub(super) async fn build_mem_snapshot_image_config(
+pub(crate) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
     new_layer_path: &Path,
     output_dir: &Path,
@@ -632,7 +632,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     live_snapshot.finish_staging(staged_snapshot)
 }
 
-pub(super) async fn restack_snapshot_overlaybd_rootfs(
+pub(crate) async fn restack_snapshot_overlaybd_rootfs(
     ublk_device: &UblkDevice,
     read_only: bool,
     live_runtime_image_config_path: &Path,

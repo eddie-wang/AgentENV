@@ -17,23 +17,35 @@ use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackend
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig,
 };
+use crate::sandbox::{fresh_backend_is_container, ContainerSandboxFactory};
 use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
 
+/// The node's sandbox factory.
+///
+/// Builds Firecracker sandboxes, and dispatches to the container backend
+/// (prototype) for: fresh launches when `AENV_SANDBOX_BACKEND=container`,
+/// snapshots whose manifest names the container backend, and container
+/// paused states.
 pub struct FirecrackerSandboxFactory {
     cpu_config_arc: Option<Arc<RwLock<Option<String>>>>,
+    container: ContainerSandboxFactory,
+    fresh_container: bool,
 }
 
 impl FirecrackerSandboxFactory {
     pub fn new() -> Self {
         Self {
             cpu_config_arc: None,
+            container: ContainerSandboxFactory::new(),
+            fresh_container: fresh_backend_is_container(),
         }
     }
 
     pub fn with_cpu_config(arc: Arc<RwLock<Option<String>>>) -> Self {
         Self {
             cpu_config_arc: Some(arc),
+            ..Self::new()
         }
     }
 }
@@ -80,6 +92,9 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
+        if self.fresh_container {
+            return self.container.build(build_spec, launch_config);
+        }
         let user_image_config = OverlaybdConfig {
             image_config_path: build_spec.image_config_path,
             read_only: false,
@@ -148,6 +163,9 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         snapshot: &RunnableSnapshot,
         launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
+        if ContainerSandboxFactory::handles_snapshot(snapshot) {
+            return self.container.build_from_snapshot(snapshot, launch_config);
+        }
         let sandbox = FirecrackerSandbox::from_snapshot(snapshot, &launch_config)?;
         Ok(Box::new(sandbox))
     }
@@ -157,6 +175,9 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         artifact_root: PathBuf,
         state: Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
+        if ContainerSandboxFactory::handles_encoded_paused_state(&state) {
+            return self.container.decode_paused_state(artifact_root, state);
+        }
         Ok(Arc::new(FirecrackerPausedState::decode(
             artifact_root,
             state,
@@ -169,6 +190,11 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
+        if ContainerSandboxFactory::handles_paused_state(state) {
+            return self
+                .container
+                .build_from_paused_state(sandbox_id, state, envd_access_token);
+        }
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;
