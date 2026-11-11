@@ -342,6 +342,28 @@ async fn restore_snapshot_volume_mounts(
                 return Err(ApiImpl::error(400, error.to_string()));
             }
         };
+        if volume_snapshot.mode == VolumeMode::ReadOnly {
+            // Every restore of this captured read-only volume shares one record,
+            // so it is not cleaned up with this sandbox.
+            match api
+                .volume_manager
+                .read_only_volume_for_snapshot(
+                    volume_snapshot.size_mb,
+                    volume_snapshot.layers.clone(),
+                )
+                .await
+            {
+                Ok(Some(volume)) => {
+                    mounts.insert(mount_path.to_string_lossy().into_owned(), volume.id);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+                    return Err(volume_error_response(error).1);
+                }
+            }
+        }
         let name = format!("volume-restore-{}", Uuid::now_v7().simple());
         let child = match api
             .volume_manager

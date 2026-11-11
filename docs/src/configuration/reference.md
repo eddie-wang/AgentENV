@@ -306,6 +306,7 @@ Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every run
 |-----|------|---------|-------------|
 | `max_size_mb` | integer | `262144` | Maximum persistent volume size in MiB (256 GiB). |
 | `max_volume_count` | integer | `4` | Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit. |
+| `read_only_node_lease_idle_secs` | integer | `300` | Seconds a node keeps its catalog lease on a read-only volume after its last local mount is released. Re-mounting within this window writes no catalog document; deleting the volume from another node waits for the lease to expire. `0` releases it with the last local mount. |
 
 ## `[orchestrator]`
 

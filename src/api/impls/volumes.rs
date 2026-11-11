@@ -67,7 +67,7 @@ async fn resolve_volume_mounts_inner(
             ));
         }
         let volume = manager
-            .get(reference)
+            .get_for_mount(reference)
             .await
             .map_err(|error| error_response(error).1)?;
         if volume.size_mb > limits.max_size_mb {
@@ -83,7 +83,7 @@ async fn resolve_volume_mounts_inner(
             ));
         }
         manager
-            .reserve(&volume.id, owner)
+            .reserve_mount(&volume, owner)
             .await
             .map_err(|error| error_response(error).1)?;
         reserved.push(volume.id.clone());

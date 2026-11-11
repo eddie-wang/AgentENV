@@ -229,6 +229,22 @@ where
                     .map(|paused_state| (metadata.id, Arc::clone(paused_state)))
             })
             .collect();
+        if let Some(volume_manager) = volume_manager.as_ref() {
+            // Node-local read-only mounts outlive the process; keep only those
+            // of restored sandboxes before any create can reuse the lease.
+            let live_mounts = persisted
+                .iter()
+                .map(|metadata| {
+                    (
+                        metadata.id.to_string(),
+                        metadata.volume_mounts.values().cloned().collect(),
+                    )
+                })
+                .collect();
+            volume_manager
+                .reconcile_read_only_mounts(&live_mounts)
+                .await;
+        }
         for metadata in persisted {
             store.add(metadata).await?;
         }

@@ -305,6 +305,12 @@ pub struct VolumeConfig {
     /// Maximum number of persistent volumes a sandbox may mount.
     #[config(default = 4usize)]
     pub max_volume_count: usize,
+    /// Seconds a node keeps its catalog lease on a read-only volume after the
+    /// last local sandbox releases it. Re-mounting within this window writes
+    /// no catalog document; deleting the volume from another node waits for
+    /// it. `0` releases the lease with the last local mount.
+    #[config(default = 300u64)]
+    pub read_only_node_lease_idle_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]

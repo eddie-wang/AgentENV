@@ -12,8 +12,10 @@ use uuid::Uuid;
 
 use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::OverlaybdLayerRef;
+use read_only_mounts::ReadOnlyMountLedger;
 
 mod catalog;
+mod read_only_mounts;
 pub use crate::types::VolumeMode;
 pub use catalog::{VolumeCatalog, VolumeRecordPage};
 
@@ -154,12 +156,18 @@ pub struct VolumeManager {
     root: PathBuf,
     repository: Arc<dyn Repository>,
     limits: VolumeLimits,
+    read_only_mounts: Arc<ReadOnlyMountLedger>,
+    /// One in-flight get-or-create per snapshot read-only volume name.
+    snapshot_volume_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct VolumeLimits {
     pub max_size_mb: u64,
     pub max_mounts: usize,
+    /// Seconds a node keeps its catalog lease on a read-only volume after its
+    /// last local mount is released. `0` releases it immediately.
+    pub read_only_node_lease_idle_secs: u64,
 }
 
 impl Default for VolumeLimits {
@@ -168,6 +176,7 @@ impl Default for VolumeLimits {
         Self {
             max_size_mb: config.max_size_mb,
             max_mounts: config.max_volume_count,
+            read_only_node_lease_idle_secs: config.read_only_node_lease_idle_secs,
         }
     }
 }
@@ -191,11 +200,18 @@ impl VolumeManager {
             .ok_or_else(|| anyhow::anyhow!("volume catalog path has no parent"))?
             .to_path_buf();
         limits.max_mounts = limits.max_mounts.min(crate::cfg::MAX_VOLUME_MOUNTS);
+        let read_only_mounts = ReadOnlyMountLedger::open(
+            root.join("read-only-mounts"),
+            Arc::clone(&repository),
+            std::time::Duration::from_secs(limits.read_only_node_lease_idle_secs),
+        )?;
         Ok(Self {
             records: Arc::new(RwLock::new(HashMap::new())),
             root,
             repository,
             limits,
+            read_only_mounts,
+            snapshot_volume_gates: Arc::default(),
         })
     }
 
@@ -246,7 +262,7 @@ impl VolumeManager {
     }
 
     pub async fn materialize_backing(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
-        let mut record = self.get(reference).await?;
+        let mut record = self.get_for_mount(reference).await?;
         if record
             .backing_image_config
             .as_ref()
@@ -441,8 +457,18 @@ impl VolumeManager {
         if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
             return Err(VolumeError::Reserved(owner.to_owned()));
         }
-        if let Some(owner) = record.read_only_mounts.first() {
+        let node_owner = self.read_only_mounts.node_owner();
+        if let Some(owner) = record
+            .read_only_mounts
+            .iter()
+            .find(|owner| owner.as_str() != node_owner)
+        {
             return Err(VolumeError::Reserved(owner.clone()));
+        }
+        if record.read_only_mounts.iter().any(|owner| owner == node_owner) {
+            // Only this node's idle lease remains; drop it instead of making
+            // the caller wait for the idle release.
+            self.read_only_mounts.release_for_delete(&record.id).await?;
         }
         debug!(volume_id = %record.id, "deleting volume");
         self.repository
@@ -600,6 +626,117 @@ impl VolumeManager {
         Ok(())
     }
 
+    /// Reserves `record`, as just resolved by [`Self::get_for_mount`], for a
+    /// sandbox mount. Exclusive volumes use [`Self::reserve`]; read-only
+    /// volumes are tracked in the node-local ledger and write the catalog only
+    /// for the node's first mount.
+    pub async fn reserve_mount(&self, record: &VolumeRecord, owner: &str) -> Result<(), VolumeError> {
+        if record.mode != VolumeMode::ReadOnly {
+            return self.reserve(&record.id, owner).await;
+        }
+        match record.status {
+            VolumeStatus::Uploading => return Err(VolumeError::Uploading(record.id.clone())),
+            VolumeStatus::Failed => return Err(VolumeError::Failed(record.id.clone())),
+            VolumeStatus::Ready => {}
+        }
+        if !is_valid_volume_component(owner) {
+            return Err(VolumeError::Storage(format!("invalid volume owner '{owner}'")));
+        }
+        self.read_only_mounts.acquire(&record.id, owner).await?;
+        debug!(volume_id = %record.id, %owner, "read-only volume mounted on node");
+        // Keep a concurrent mount's materialized backing path.
+        self.records
+            .write()
+            .await
+            .entry(record.id.clone())
+            .or_insert_with(|| record.clone());
+        Ok(())
+    }
+
+    /// Resolves a volume for mounting. A read-only volume whose node lease
+    /// this node holds is served from the local cache: the lease blocks its
+    /// deletion, and read-only identity, layers, and status never change.
+    pub async fn get_for_mount(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
+        let cached = {
+            let records = self.records.read().await;
+            records
+                .get(reference)
+                .or_else(|| records.values().find(|record| record.name == reference))
+                .filter(|record| record.mode == VolumeMode::ReadOnly)
+                .cloned()
+        };
+        if let Some(mut record) = cached {
+            if self.read_only_mounts.holds(&record.id).await {
+                record.backing_image_config =
+                    record.backing_image_config.filter(|path| path.exists());
+                return Ok(record);
+            }
+        }
+        self.get(reference).await
+    }
+
+    /// Returns the read-only volume shared by every restore of a captured
+    /// read-only volume with these layers, creating it once per cluster.
+    /// `None` means an unrelated volume holds the derived name.
+    pub(crate) async fn read_only_volume_for_snapshot(
+        &self,
+        size_mb: u64,
+        backing_layers: Vec<OverlaybdLayerRef>,
+    ) -> Result<Option<VolumeRecord>, VolumeError> {
+        let name = snapshot_read_only_volume_name(size_mb, &backing_layers)?;
+        let gate = Arc::clone(
+            self.snapshot_volume_gates
+                .lock()
+                .unwrap()
+                .entry(name.clone())
+                .or_default(),
+        );
+        let _gate = gate.lock().await;
+        let matches = |record: &VolumeRecord| {
+            record.mode == VolumeMode::ReadOnly
+                && record.size_mb == size_mb
+                && record.backing_layers == backing_layers
+                && record.status == VolumeStatus::Ready
+        };
+        match self.get_for_mount(&name).await {
+            Ok(record) => return Ok(matches(&record).then_some(record)),
+            Err(VolumeError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        match self
+            .create_from_snapshot(
+                name.clone(),
+                VolumeMode::ReadOnly,
+                size_mb,
+                backing_layers.clone(),
+            )
+            .await
+        {
+            Ok(record) => Ok(Some(record)),
+            // Another node created it first; reuse theirs.
+            Err(VolumeError::NameConflict(_)) => {
+                let record = self.get(&name).await?;
+                Ok(matches(&record).then_some(record))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Drops node-local read-only mounts whose owner did not survive a
+    /// restart. `live_mounts` maps each restored sandbox ID to its volume IDs.
+    pub async fn reconcile_read_only_mounts(
+        &self,
+        live_mounts: &HashMap<String, Vec<String>>,
+    ) {
+        self.read_only_mounts
+            .reconcile(|owner, volume_id| {
+                live_mounts
+                    .get(owner)
+                    .is_some_and(|volume_ids| volume_ids.iter().any(|id| id == volume_id))
+            })
+            .await;
+    }
+
     pub async fn replace_owner_for(
         &self,
         owner: &str,
@@ -607,6 +744,14 @@ impl VolumeManager {
         volume_ids: &[String],
     ) -> Result<(), VolumeError> {
         for volume_id in volume_ids {
+            if self
+                .read_only_mounts
+                .replace_owner(volume_id, owner, new_owner)
+                .await?
+            {
+                debug!(volume_id = %volume_id, %owner, new_owner = ?new_owner, "node-local read-only volume mount updated");
+                continue;
+            }
             self.repository
                 .replace_volume_owner_for(volume_id, owner, new_owner)
                 .await
@@ -907,6 +1052,23 @@ impl VolumeManager {
     }
 }
 
+/// Content-derived so every restore of the same captured read-only volume,
+/// on any node, resolves the same record.
+fn snapshot_read_only_volume_name(
+    size_mb: u64,
+    backing_layers: &[OverlaybdLayerRef],
+) -> Result<String, VolumeError> {
+    use sha2::{Digest, Sha256};
+
+    let layers = serde_json::to_vec(backing_layers)
+        .map_err(|error| VolumeError::Storage(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(size_mb.to_le_bytes());
+    hasher.update(&layers);
+    let digest = hex::encode(hasher.finalize());
+    Ok(format!("volume-ro-{}", &digest[..32]))
+}
+
 fn repository_error(error: RepositoryError) -> VolumeError {
     match error {
         RepositoryError::VolumeNotFound { lookup } => VolumeError::NotFound(lookup),
@@ -953,11 +1115,14 @@ mod tests {
     use overlaybd::config::{ImageConfig, LayerConfig};
     use tempfile::NamedTempFile;
 
-    use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use super::{VolumeError, VolumeLimits, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
     use crate::digest::sha256_digest;
     use crate::repository::{
-        BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
-        Repository, RepositoryResult,
+        BlobBody, BlobKey, BlobLocation, DocumentChange, DocumentCollection, DocumentKey,
+        DocumentUpdate, Repository, RepositoryResult,
     };
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
@@ -1350,6 +1515,449 @@ mod tests {
         assert_eq!(stored.backing_layers, parent.backing_layers);
         assert_eq!(stored.status, VolumeStatus::Ready);
         assert_eq!(stored.read_only_mounts, vec!["sandbox".to_owned()]);
+    }
+
+    /// Counts catalog round trips so tests can assert which operations write
+    /// the shared catalog. A write is a put, a delete, or an applied update.
+    struct CountingRepository {
+        inner: Arc<dyn Repository>,
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    impl CountingRepository {
+        fn new(inner: Arc<dyn Repository>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                reads: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            })
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn writes(&self) -> usize {
+            self.writes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Repository for CountingRepository {
+        fn managed_layers_repo_blob_url(&self) -> Option<String> {
+            self.inner.managed_layers_repo_blob_url()
+        }
+
+        async fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
+            self.inner.put_blob(key, body).await
+        }
+
+        fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
+            self.inner.locate_blob(key)
+        }
+
+        fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
+            self.inner.staging_file()
+        }
+
+        async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.get_document(key).await
+        }
+
+        async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.put_document(key, bytes).await
+        }
+
+        async fn update_document(
+            &self,
+            key: DocumentKey,
+            update: DocumentUpdate,
+        ) -> RepositoryResult<Option<Vec<u8>>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let wrote = Arc::new(AtomicBool::new(false));
+            let last_change = Arc::clone(&wrote);
+            let observed: DocumentUpdate = Box::new(move |current| {
+                let change = update(current)?;
+                last_change.store(!matches!(change, DocumentChange::Keep), Ordering::SeqCst);
+                Ok(change)
+            });
+            let result = self.inner.update_document(key, observed).await;
+            if result.is_ok() && wrote.load(Ordering::SeqCst) {
+                self.writes.fetch_add(1, Ordering::SeqCst);
+            }
+            result
+        }
+
+        async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete_document(key).await
+        }
+
+        async fn list_documents(
+            &self,
+            collection: DocumentCollection,
+            after: Option<&str>,
+            limit: usize,
+        ) -> RepositoryResult<Vec<String>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_documents(collection, after, limit).await
+        }
+    }
+
+    fn limits_with_read_only_lease_idle(secs: u64) -> VolumeLimits {
+        VolumeLimits {
+            read_only_node_lease_idle_secs: secs,
+            ..VolumeLimits::default()
+        }
+    }
+
+    /// A POSIX repository shared by every simulated node, wrapped for counting.
+    fn counting_repository(root: &Path) -> Arc<CountingRepository> {
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.join("repository"),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: Some(root.join("runtime")),
+        })
+        .expect("POSIX snapshot backend");
+        CountingRepository::new(backend.repository())
+    }
+
+    async fn node_manager(
+        node_root: &Path,
+        repository: &Arc<CountingRepository>,
+        idle_secs: u64,
+    ) -> VolumeManager {
+        VolumeManager::open_with_repository_and_limits(
+            node_root.join("volumes/catalog"),
+            Arc::clone(repository) as Arc<dyn Repository>,
+            limits_with_read_only_lease_idle(idle_secs),
+        )
+        .await
+        .expect("volume manager")
+    }
+
+    /// Mirrors `POST /sandboxes` from a snapshot with one read-only volume:
+    /// resolve the restore volume, reserve it under a pending owner,
+    /// materialize it, then rebind the reservation to the sandbox.
+    async fn restore_read_only_mount(
+        manager: &VolumeManager,
+        size_mb: u64,
+        layers: Vec<OverlaybdLayerRef>,
+        sandbox_id: String,
+    ) -> String {
+        let volume = manager
+            .read_only_volume_for_snapshot(size_mb, layers)
+            .await
+            .expect("resolve snapshot read-only volume")
+            .expect("derived name is not taken by another volume");
+        let pending = format!("pending-{sandbox_id}");
+        let volume = manager.get_for_mount(&volume.id).await.unwrap();
+        manager.reserve_mount(&volume, &pending).await.unwrap();
+        let mounted = manager.materialize_backing(&volume.id).await.unwrap();
+        assert!(mounted.backing_image_config.unwrap().exists());
+        manager
+            .replace_owner_for(&pending, Some(&sandbox_id), std::slice::from_ref(&volume.id))
+            .await
+            .unwrap();
+        volume.id
+    }
+
+    async fn restore_concurrently(
+        manager: &VolumeManager,
+        size_mb: u64,
+        layers: &[OverlaybdLayerRef],
+        sandbox_ids: &[String],
+    ) -> Vec<String> {
+        let tasks = sandbox_ids
+            .iter()
+            .cloned()
+            .map(|sandbox_id| {
+                let manager = manager.clone();
+                let layers = layers.to_vec();
+                tokio::spawn(async move {
+                    restore_read_only_mount(&manager, size_mb, layers, sandbox_id).await
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut volume_ids = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            volume_ids.push(task.await.unwrap());
+        }
+        volume_ids
+    }
+
+    fn sandbox_ids(prefix: &str, count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("{prefix}-{index}")).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_read_only_snapshot_restores_write_the_catalog_once_per_cluster_and_node() {
+        const SANDBOXES: usize = 32;
+        let temp = tempfile::tempdir().unwrap();
+        let repository = counting_repository(temp.path());
+        let node_a = node_manager(&temp.path().join("node-a"), &repository, 300).await;
+        let parent = published_volume(temp.path(), &node_a).await;
+        let layers = parent.backing_layers.clone();
+
+        let writes_before = repository.writes();
+        let volume_ids =
+            restore_concurrently(&node_a, parent.size_mb, &layers, &sandbox_ids("cold", SANDBOXES))
+                .await;
+        let cold_writes = repository.writes() - writes_before;
+        assert!(volume_ids.iter().all(|id| id == &volume_ids[0]));
+        let volume_id = volume_ids[0].clone();
+        // One record plus its name, and one node lease, for all 32 creates.
+        assert_eq!(cold_writes, 3, "cold restores wrote {cold_writes} catalog documents");
+
+        let restored = node_a.get(&volume_id).await.unwrap();
+        assert_eq!(restored.mode, VolumeMode::ReadOnly);
+        assert_eq!(restored.backing_layers, layers);
+        let node_a_owner = node_a.read_only_mounts.node_owner().to_owned();
+        assert_eq!(restored.read_only_mounts, vec![node_a_owner.clone()]);
+
+        // Warm creates on the leased node touch no catalog document at all.
+        let (reads_before, writes_before) = (repository.reads(), repository.writes());
+        let warm = sandbox_ids("warm", SANDBOXES);
+        let warm_ids = restore_concurrently(&node_a, parent.size_mb, &layers, &warm).await;
+        assert!(warm_ids.iter().all(|id| id == &volume_id));
+        assert_eq!(repository.writes(), writes_before);
+        assert_eq!(repository.reads(), reads_before);
+
+        // Releasing every sandbox writes nothing; the idle node lease remains.
+        let writes_before = repository.writes();
+        for owner in sandbox_ids("cold", SANDBOXES).iter().chain(&warm) {
+            node_a
+                .replace_owner_for(owner, None, std::slice::from_ref(&volume_id))
+                .await
+                .unwrap();
+        }
+        assert_eq!(repository.writes(), writes_before);
+
+        // A second node shares the record and writes only its own lease.
+        let node_b = node_manager(&temp.path().join("node-b"), &repository, 300).await;
+        let writes_before = repository.writes();
+        let node_b_ids =
+            restore_concurrently(&node_b, parent.size_mb, &layers, &sandbox_ids("b", SANDBOXES))
+                .await;
+        assert!(node_b_ids.iter().all(|id| id == &volume_id));
+        assert_eq!(repository.writes() - writes_before, 1);
+
+        // Node A's idle lease still blocks a delete from node B.
+        for owner in sandbox_ids("b", SANDBOXES) {
+            node_b
+                .replace_owner_for(&owner, None, std::slice::from_ref(&volume_id))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            node_b.delete(&volume_id).await.unwrap_err(),
+            VolumeError::Reserved(node_a_owner)
+        );
+        assert!(matches!(
+            node_a.delete(&volume_id).await.unwrap_err(),
+            VolumeError::Reserved(owner) if owner == node_b.read_only_mounts.node_owner()
+        ));
+        // Stands in for node A's idle timer; node B then drops its own idle
+        // lease as part of a local delete.
+        node_a
+            .read_only_mounts
+            .release_for_delete(&volume_id)
+            .await
+            .unwrap();
+        node_b.delete(&volume_id).await.unwrap();
+        assert_eq!(
+            node_a.get(&volume_id).await.unwrap_err(),
+            VolumeError::NotFound(volume_id)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_cold_restores_on_two_nodes_reuse_the_record_that_won_the_name() {
+        const SANDBOXES_PER_NODE: usize = 16;
+        let temp = tempfile::tempdir().unwrap();
+        let repository = counting_repository(temp.path());
+        let node_a = node_manager(&temp.path().join("node-a"), &repository, 300).await;
+        let node_b = node_manager(&temp.path().join("node-b"), &repository, 300).await;
+        let parent = published_volume(temp.path(), &node_a).await;
+        let layers = parent.backing_layers.clone();
+
+        let writes_before = repository.writes();
+        let a_ids = sandbox_ids("a", SANDBOXES_PER_NODE);
+        let b_ids = sandbox_ids("b", SANDBOXES_PER_NODE);
+        let (on_a, on_b) = tokio::join!(
+            restore_concurrently(&node_a, parent.size_mb, &layers, &a_ids),
+            restore_concurrently(&node_b, parent.size_mb, &layers, &b_ids),
+        );
+        let volume_id = on_a[0].clone();
+        assert!(on_a.iter().chain(&on_b).all(|id| id == &volume_id));
+        // At most: the winner's record and name, a losing node's rolled-back
+        // record, and one lease per node.
+        let writes = repository.writes() - writes_before;
+        assert!(writes <= 6, "cold restores wrote {writes} catalog documents");
+        let mut leases = node_a.get(&volume_id).await.unwrap().read_only_mounts;
+        leases.sort();
+        let mut expected = vec![
+            node_a.read_only_mounts.node_owner().to_owned(),
+            node_b.read_only_mounts.node_owner().to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(leases, expected);
+    }
+
+    #[tokio::test]
+    async fn read_only_mount_ledger_survives_restart_and_drops_stale_owners() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = counting_repository(temp.path());
+        let node_root = temp.path().join("node");
+        let manager = node_manager(&node_root, &repository, 300).await;
+        let parent = published_volume(temp.path(), &manager).await;
+        let volume = manager
+            .read_only_volume_for_snapshot(parent.size_mb, parent.backing_layers.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        for owner in ["live-sandbox", "stale-sandbox", "pending-create"] {
+            manager.reserve_mount(&volume, owner).await.unwrap();
+        }
+        let node_owner = manager.read_only_mounts.node_owner().to_owned();
+        drop(manager);
+
+        // Restart with immediate idle release.
+        let restarted = node_manager(&node_root, &repository, 0).await;
+        assert_eq!(restarted.read_only_mounts.node_owner(), node_owner);
+        restarted
+            .reconcile_read_only_mounts(&HashMap::from([
+                ("live-sandbox".to_owned(), vec![volume.id.clone()]),
+                ("stale-sandbox".to_owned(), vec!["vol_other".to_owned()]),
+            ]))
+            .await;
+        // The live owner keeps the volume mounted; the lease is reused as-is.
+        assert_eq!(
+            restarted.delete(&volume.id).await.unwrap_err(),
+            VolumeError::Reserved("live-sandbox".to_owned())
+        );
+        let record = restarted.get_for_mount(&volume.id).await.unwrap();
+        let writes_before = repository.writes();
+        restarted.reserve_mount(&record, "next-sandbox").await.unwrap();
+        assert_eq!(repository.writes(), writes_before);
+        // Stale owners were dropped, so releasing the live ones frees the lease.
+        assert!(!restarted
+            .read_only_mounts
+            .replace_owner(&volume.id, "stale-sandbox", None)
+            .await
+            .unwrap());
+        restarted
+            .replace_owner_for("live-sandbox", None, std::slice::from_ref(&volume.id))
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.get(&volume.id).await.unwrap().read_only_mounts,
+            vec![node_owner]
+        );
+        restarted
+            .replace_owner_for("next-sandbox", None, std::slice::from_ref(&volume.id))
+            .await
+            .unwrap();
+        assert!(restarted
+            .get(&volume.id)
+            .await
+            .unwrap()
+            .read_only_mounts
+            .is_empty());
+        assert!(!node_root
+            .join("volumes/read-only-mounts")
+            .join(format!("{}.json", volume.id))
+            .exists());
+        let other_node = node_manager(&temp.path().join("other"), &repository, 300).await;
+        other_node.delete(&volume.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_mounts_reserved_by_earlier_releases_are_released_through_the_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager_at(temp.path()).await;
+        let parent = published_volume(temp.path(), &manager).await;
+        let seed = manager
+            .create(
+                "seed".to_owned(),
+                VolumeMode::ReadOnly,
+                Some(parent.id.clone()),
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
+        // `reserve` keeps the per-owner catalog lease used before node leases.
+        manager.reserve(&seed.id, "legacy-sandbox").await.unwrap();
+        assert_eq!(
+            manager.get(&seed.id).await.unwrap().read_only_mounts,
+            vec!["legacy-sandbox".to_owned()]
+        );
+        manager
+            .replace_owner_for("legacy-sandbox", None, std::slice::from_ref(&seed.id))
+            .await
+            .unwrap();
+        assert!(manager
+            .get(&seed.id)
+            .await
+            .unwrap()
+            .read_only_mounts
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn exclusive_mount_reservation_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager_at(temp.path()).await;
+        let volume = published_volume(temp.path(), &manager).await;
+        manager.reserve_mount(&volume, "first").await.unwrap();
+        let record = manager.get(&volume.id).await.unwrap();
+        assert_eq!(record.reserved_by_sandbox_id.as_deref(), Some("first"));
+        assert!(record.read_only_mounts.is_empty());
+        assert_eq!(
+            manager.reserve_mount(&record, "second").await.unwrap_err(),
+            VolumeError::Reserved("first".to_owned())
+        );
+        manager
+            .replace_owner_for("first", None, std::slice::from_ref(&volume.id))
+            .await
+            .unwrap();
+        assert!(manager
+            .get(&volume.id)
+            .await
+            .unwrap()
+            .reserved_by_sandbox_id
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn read_only_snapshot_volume_name_taken_by_another_volume_falls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager_at(temp.path()).await;
+        let parent = published_volume(temp.path(), &manager).await;
+        let name =
+            super::snapshot_read_only_volume_name(parent.size_mb, &parent.backing_layers).unwrap();
+        manager
+            .create_from_snapshot(
+                name,
+                VolumeMode::ReadOnly,
+                parent.size_mb,
+                vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                    digest: "sha256:other".to_owned(),
+                    size: 1,
+                    uuid: None,
+                })],
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .read_only_volume_for_snapshot(parent.size_mb, parent.backing_layers.clone())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

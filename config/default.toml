@@ -198,6 +198,9 @@ poll_ms = 3
 max_size_mb = 262144
 # Maximum number of persistent volumes a sandbox may mount.
 max_volume_count = 4
+# Seconds a node keeps its catalog lease on a read-only volume after its last
+# local mount is released. Deleting the volume from another node waits for it.
+read_only_node_lease_idle_secs = 300
 
 [orchestrator]
 # Guest metrics collection interval in seconds. Set to 0 to disable collection.

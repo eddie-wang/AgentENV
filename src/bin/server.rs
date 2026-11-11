@@ -121,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
             VolumeLimits {
                 max_size_mb: config.volume.max_size_mb,
                 max_mounts: config.volume.max_volume_count,
+                read_only_node_lease_idle_secs: config.volume.read_only_node_lease_idle_secs,
             },
         )
         .await?,
