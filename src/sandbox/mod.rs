@@ -38,7 +38,9 @@ pub use backend::{
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use container::{
-    fresh_backend_is_container, shutdown_container_backend, ContainerCheckpoint, ContainerLaunch, ContainerPausedState,
+    container_enabled, container_enabled_from_env, default_fresh_backend,
+    ensure_container_enabled, ensure_microvm_available, fresh_backend_is_container,
+    set_container_enabled, shutdown_container_backend, ContainerCheckpoint, SandboxBackendKind, ContainerLaunch, ContainerPausedState,
     ContainerSandbox, ContainerSandboxFactory,
 };
 pub use envd::EnvdApi;
@@ -67,6 +69,8 @@ pub struct FreshSandboxBuildSpec {
     pub resources: crate::types::SandboxResources,
     pub extra_drives: Vec<ExtraDrive>,
     pub extra_boot_args: Option<String>,
+    /// Requested runtime; `None` uses the node default (`AENV_SANDBOX_BACKEND`).
+    pub backend: Option<SandboxBackendKind>,
 }
 
 /// High-level launch request consumed by sandbox backend factories.

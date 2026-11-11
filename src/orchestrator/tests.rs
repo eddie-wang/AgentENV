@@ -1233,6 +1233,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
                 resources: Some(resources),
                 extra_drives: Vec::new(),
                 extra_boot_args: None,
+                backend: None,
                 image_configs: Box::new(ImageConfigs::new()),
             },
             extra_drives: Vec::new(),

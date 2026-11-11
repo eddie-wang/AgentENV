@@ -1448,6 +1448,7 @@ impl Drop for FirecrackerSandbox {
 
 impl FirecrackerSandbox {
     fn build(id: SandboxId, launch: LaunchMode) -> Result<Self> {
+        crate::sandbox::ensure_microvm_available()?;
         let work_dir =
             create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());

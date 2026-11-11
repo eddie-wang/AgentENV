@@ -710,6 +710,35 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
+        // Requested runtime, checked before any image work so an unavailable
+        // backend fails fast with a client error.
+        let backend = match body.backend.as_deref() {
+            None => None,
+            Some(value) => match crate::sandbox::SandboxBackendKind::parse(value) {
+                Ok(kind) => Some(kind),
+                Err(err) => {
+                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        err.to_string(),
+                    )))
+                }
+            },
+        };
+        let effective = backend.unwrap_or_else(crate::sandbox::default_fresh_backend);
+        let available = match effective {
+            crate::sandbox::SandboxBackendKind::Container => {
+                crate::sandbox::ensure_container_enabled()
+            }
+            crate::sandbox::SandboxBackendKind::Firecracker => {
+                crate::sandbox::ensure_microvm_available()
+            }
+        };
+        if let Err(err) = available {
+            return Ok(SandboxesColdPostResponse::Status400_BadRequest(Self::error(
+                400,
+                format!("{err:#}"),
+            )));
+        }
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
         // TODO: Move cold-start image resolution into an async create operation
@@ -814,6 +843,7 @@ impl Sandboxes<()> for ApiImpl {
                 resources: Some(resources),
                 extra_drives,
                 extra_boot_args: body.extra_boot_args.clone(),
+                backend: Some(effective),
                 image_configs: Box::new(image_configs),
             },
             extra_drives: Vec::new(),

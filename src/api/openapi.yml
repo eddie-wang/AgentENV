@@ -810,6 +810,10 @@ components:
         extraBootArgs:
           type: string
           description: Additional kernel command-line arguments appended to the Firecracker boot args for this cold-start sandbox. Arguments are whitespace-separated and may contain only 0-9, a-z, A-Z, underscore, hyphen, dot, slash, plus, or equals sign, so base64 values are allowed. The server also applies the firecracker.allowed_extra_boot_args_prefixes allowlist; non-matching or invalid arguments are silently ignored.
+        backend:
+          type: string
+          enum: [firecracker, container]
+          description: Sandbox runtime. "firecracker" is a microVM (needs KVM on the node); "container" is an OCI container run by runc with CRIU snapshots (needs the node to run with --enable-container). Omit to use the node default (AENV_SANDBOX_BACKEND, normally firecracker). Sandboxes created later from a snapshot of this sandbox keep its backend.
 
     ConnectSandbox:
       type: object

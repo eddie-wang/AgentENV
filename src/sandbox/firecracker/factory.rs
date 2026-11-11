@@ -17,20 +17,20 @@ use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackend
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig,
 };
-use crate::sandbox::{fresh_backend_is_container, ContainerSandboxFactory};
+use crate::sandbox::{default_fresh_backend, ContainerSandboxFactory, SandboxBackendKind};
 use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
 
 /// The node's sandbox factory.
 ///
 /// Builds Firecracker sandboxes, and dispatches to the container backend
-/// (prototype) for: fresh launches when `AENV_SANDBOX_BACKEND=container`,
-/// snapshots whose manifest names the container backend, and container
-/// paused states.
+/// (prototype) for: fresh launches that request it (`backend` on
+/// `/sandboxes-cold`, default `AENV_SANDBOX_BACKEND`), snapshots whose
+/// manifest names the container backend, and container paused states.
 pub struct FirecrackerSandboxFactory {
     cpu_config_arc: Option<Arc<RwLock<Option<String>>>>,
     container: ContainerSandboxFactory,
-    fresh_container: bool,
+    default_backend: SandboxBackendKind,
 }
 
 impl FirecrackerSandboxFactory {
@@ -38,7 +38,7 @@ impl FirecrackerSandboxFactory {
         Self {
             cpu_config_arc: None,
             container: ContainerSandboxFactory::new(),
-            fresh_container: fresh_backend_is_container(),
+            default_backend: default_fresh_backend(),
         }
     }
 
@@ -92,7 +92,8 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
-        if self.fresh_container {
+        let backend = build_spec.backend.unwrap_or(self.default_backend);
+        if backend == SandboxBackendKind::Container {
             return self.container.build(build_spec, launch_config);
         }
         let user_image_config = OverlaybdConfig {

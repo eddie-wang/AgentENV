@@ -19,6 +19,8 @@ pub enum SandboxLaunchSource {
         resources: Option<crate::types::SandboxResources>,
         extra_drives: Vec<crate::sandbox::ExtraDrive>,
         extra_boot_args: Option<String>,
+        /// Requested runtime; `None` uses the node default.
+        backend: Option<crate::sandbox::SandboxBackendKind>,
         /// Raw source image config metadata for the sandbox's resolved images.
         image_configs: Box<ImageConfigs>,
     },

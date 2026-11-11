@@ -3633,6 +3633,12 @@ pub struct NewColdSandbox {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_boot_args: Option<String>,
+
+    /// Sandbox runtime: "firecracker" (microVM, default) or "container" (runc + CRIU; requires the node to run with --enable-container). Omit to use the node default.
+    #[serde(rename = "backend")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
 }
 
 impl NewColdSandbox {
@@ -3655,6 +3661,7 @@ impl NewColdSandbox {
             disk_size_mb: None,
             attached_drives: None,
             extra_boot_args: None,
+            backend: None,
         }
     }
 }
@@ -3709,6 +3716,9 @@ impl std::fmt::Display for NewColdSandbox {
             self.extra_boot_args.as_ref().map(|extra_boot_args| {
                 ["extraBootArgs".to_string(), extra_boot_args.to_string()].join(",")
             }),
+            self.backend
+                .as_ref()
+                .map(|backend| ["backend".to_string(), backend.to_string()].join(",")),
         ];
 
         write!(
@@ -3747,6 +3757,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub disk_size_mb: Vec<u32>,
             pub attached_drives: Vec<Vec<models::AttachedDrive>>,
             pub extra_boot_args: Vec<String>,
+            pub backend: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3844,6 +3855,10 @@ impl std::str::FromStr for NewColdSandbox {
                     "extraBootArgs" => intermediate_rep.extra_boot_args.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "backend" => intermediate_rep.backend.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewColdSandbox".to_string(),
@@ -3878,6 +3893,7 @@ impl std::str::FromStr for NewColdSandbox {
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
             attached_drives: intermediate_rep.attached_drives.into_iter().next(),
             extra_boot_args: intermediate_rep.extra_boot_args.into_iter().next(),
+            backend: intermediate_rep.backend.into_iter().next(),
         })
     }
 }

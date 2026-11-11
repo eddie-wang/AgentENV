@@ -51,6 +51,12 @@ struct ServerCli {
     /// Path to config file (same as AENV_CONFIG_PATH).
     #[arg(long)]
     config: Option<std::path::PathBuf>,
+
+    /// Enable the container (runc + CRIU) backend next to microVMs. The node
+    /// then starts without KVM; microVM requests fail individually.
+    /// Same as AENV_ENABLE_CONTAINER=1.
+    #[arg(long)]
+    enable_container: bool,
 }
 
 #[tokio::main]
@@ -91,7 +97,12 @@ async fn main() -> anyhow::Result<()> {
     let overlaybd_p2p =
         OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
 
+    agentenv::sandbox::set_container_enabled(
+        cli.enable_container || agentenv::sandbox::container_enabled_from_env(),
+    );
+    info!(target: "agentenv", container_backend = agentenv::sandbox::container_enabled(), "sandbox backends");
     agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
+    let microvm_available = agentenv::sandbox::ensure_microvm_available().is_ok();
 
     // Initialize the global ublk device manager (spawns daemon if configured).
     UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
@@ -100,7 +111,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
+    if !microvm_available {
+        info!(target: "agentenv", "KVM unavailable; skipping firecracker pool prime");
+    } else if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
         warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
     }
 

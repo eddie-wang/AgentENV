@@ -1,6 +1,7 @@
 //! Factory for [`ContainerSandbox`] and the node-wide backend choice.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
@@ -15,13 +16,100 @@ use crate::sandbox::{
 use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
 
-/// Backend used for sandboxes created from an image on this node
-/// (`AENV_SANDBOX_BACKEND=container|firecracker`, default firecracker).
-/// Snapshots and paused sandboxes always go back to the backend that took them.
-pub fn fresh_backend_is_container() -> bool {
+/// Which runtime runs a sandbox.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SandboxBackendKind {
+    /// Firecracker microVM (needs KVM).
+    #[default]
+    Firecracker,
+    /// OCI container: runc + CRIU (no KVM needed). Requires `--enable-container`.
+    Container,
+}
+
+impl SandboxBackendKind {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "firecracker" | "microvm" | "vm" => Ok(Self::Firecracker),
+            "container" | "docker" | "runc" => Ok(Self::Container),
+            other => anyhow::bail!(
+                "unknown sandbox backend '{other}'; expected 'firecracker' (microvm) or 'container'"
+            ),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Firecracker => crate::sandbox::FIRECRACKER_BACKEND,
+            Self::Container => CONTAINER_BACKEND,
+        }
+    }
+}
+
+static CONTAINER_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Successful KVM probe, cached; failures are re-probed on every microVM request.
+static KVM_READY: AtomicBool = AtomicBool::new(false);
+
+/// Enable the container backend on this node (server `--enable-container` or
+/// `AENV_ENABLE_CONTAINER=1`). A node with it enabled starts without KVM.
+pub fn set_container_enabled(enabled: bool) {
+    CONTAINER_ENABLED.store(enabled, Ordering::Release);
+}
+
+pub fn container_enabled() -> bool {
+    CONTAINER_ENABLED.load(Ordering::Acquire)
+}
+
+/// `AENV_ENABLE_CONTAINER` (or the older `AENV_SANDBOX_BACKEND=container`) set.
+pub fn container_enabled_from_env() -> bool {
+    let truthy = |name: &str| {
+        std::env::var(name)
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    };
+    truthy("AENV_ENABLE_CONTAINER") || default_fresh_backend() == SandboxBackendKind::Container
+}
+
+/// Backend for `/sandboxes-cold` requests that do not name one
+/// (`AENV_SANDBOX_BACKEND`, default firecracker). Snapshots and paused
+/// sandboxes always go back to the backend that took them.
+pub fn default_fresh_backend() -> SandboxBackendKind {
     std::env::var("AENV_SANDBOX_BACKEND")
-        .map(|value| value.trim().eq_ignore_ascii_case(CONTAINER_BACKEND))
-        .unwrap_or(false)
+        .ok()
+        .and_then(|value| SandboxBackendKind::parse(&value).ok())
+        .unwrap_or_default()
+}
+
+/// Kept for callers of the first prototype.
+pub fn fresh_backend_is_container() -> bool {
+    default_fresh_backend() == SandboxBackendKind::Container
+}
+
+/// Fail a request that needs the container backend when it is not enabled.
+pub fn ensure_container_enabled() -> Result<()> {
+    anyhow::ensure!(
+        container_enabled(),
+        "the container backend is not enabled on this node; start the server with --enable-container (or AENV_ENABLE_CONTAINER=1)"
+    );
+    Ok(())
+}
+
+/// Lazy KVM check for microVM operations. The server no longer refuses to
+/// start without KVM when the container backend is enabled; instead every
+/// microVM request checks here and fails on its own, leaving the node up.
+pub fn ensure_microvm_available() -> Result<()> {
+    if KVM_READY.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mode = crate::cfg::ConfigManager::global_config().virtualization_mode;
+    crate::setup::check_kvm(mode).map_err(|error| {
+        anyhow::anyhow!(
+            "microVM (firecracker) sandboxes are unavailable on this node: {error:#}. \
+             This node can still run container sandboxes{}",
+            if container_enabled() { "" } else { " if started with --enable-container" }
+        )
+    })?;
+    KVM_READY.store(true, Ordering::Release);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -51,6 +139,7 @@ impl SandboxBackendFactory for ContainerSandboxFactory {
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
+        ensure_container_enabled()?;
         ensure!(
             build_spec.extra_drives.is_empty() && launch_config.extra_drives.is_empty(),
             "the container backend does not support attached drives or volumes yet"
@@ -93,6 +182,7 @@ impl SandboxBackendFactory for ContainerSandboxFactory {
         snapshot: &RunnableSnapshot,
         launch_config: SandboxLaunchConfig,
     ) -> Result<Box<dyn SandboxBackend>> {
+        ensure_container_enabled()?;
         ensure!(
             launch_config.extra_drives.is_empty(),
             "the container backend does not support launch-time volumes yet"
@@ -139,6 +229,7 @@ impl SandboxBackendFactory for ContainerSandboxFactory {
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
+        ensure_container_enabled()?;
         let paused = state
             .downcast_ref::<ContainerPausedState>()
             .context("the provided PausedSandboxState is not a container paused state")?;

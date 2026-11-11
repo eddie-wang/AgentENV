@@ -6,7 +6,11 @@ mod factory;
 mod runtime;
 mod sandbox;
 
-pub use factory::{fresh_backend_is_container, ContainerSandboxFactory};
+pub use factory::{
+    container_enabled, container_enabled_from_env, default_fresh_backend,
+    ensure_container_enabled, ensure_microvm_available, fresh_backend_is_container,
+    set_container_enabled, ContainerSandboxFactory, SandboxBackendKind,
+};
 pub use sandbox::{ContainerCheckpoint, ContainerLaunch, ContainerPausedState, ContainerSandbox};
 
 /// Release node-wide container backend resources (tools-drive mounts).

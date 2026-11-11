@@ -553,6 +553,7 @@ where
                 resources,
                 mut extra_drives,
                 extra_boot_args,
+                backend,
                 image_configs,
             } => {
                 let context = *context;
@@ -581,6 +582,7 @@ where
                     resources,
                     extra_drives,
                     extra_boot_args,
+                    backend,
                 };
 
                 let transitional_metadata = SandboxMetadata {

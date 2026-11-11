@@ -98,6 +98,11 @@ fn is_valid_runtime_account_name(name: &str) -> bool {
 /// 1. Verify the configured KVM/PVM host mode and `/dev/kvm` access
 /// 2. Ensure ublk kernel module is loaded and permissions are set
 /// 3. Provision firecracker, kernel, local tools overrides, and OverlayBD
+/// Probe KVM for the configured virtualization mode (used lazily by microVM requests).
+pub fn check_kvm(mode: crate::virtualization::VirtualizationMode) -> Result<()> {
+    kvm::check(mode)
+}
+
 pub async fn ensure_environment(
     config: &AppConfig,
     p2p_facade_address: Option<&str>,
@@ -119,10 +124,14 @@ pub async fn ensure_environment(
     // 2. Selected virtualization mode and /dev/kvm check.
     info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
     if let Err(error) = kvm::check(config.virtualization_mode) {
-        // A container-only node (AENV_SANDBOX_BACKEND=container) needs no KVM:
-        // it still serves container sandboxes; microVM launches fail at spawn.
-        if crate::sandbox::fresh_backend_is_container() {
-            tracing::warn!(error = %format_args!("{error:#}"), "KVM unavailable; container-only node (microVM sandboxes will fail)");
+        // With the container backend enabled the node starts without KVM:
+        // container sandboxes work, and each microVM request fails on its own
+        // (see `ensure_microvm_available`) instead of the whole server.
+        if crate::sandbox::container_enabled() {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "KVM unavailable: container sandboxes only; microVM requests will fail"
+            );
         } else {
             return Err(error);
         }
