@@ -28,8 +28,6 @@ pub(super) const SUPPORT_MOUNT: &str = "/.agentenv-ct";
 pub(crate) struct ContainerSettings {
     /// `runc` executable.
     pub runc: String,
-    /// CRIU executable handed to runc (`runc --criu`).
-    pub criu: String,
     /// runc state root (`runc --root`).
     pub runc_root: PathBuf,
     /// Node-local directory for mounts, support files and per-sandbox work dirs.
@@ -66,7 +64,6 @@ impl ContainerSettings {
             .to_string();
         Self {
             runc: var("AENV_CT_RUNC", "runc"),
-            criu: var("AENV_CT_CRIU", "/usr/local/sbin/criu"),
             runc_root: PathBuf::from(var("AENV_CT_RUNC_ROOT", "/run/aenv-ct/runc")),
             base_dir: PathBuf::from(var("AENV_CT_BASE_DIR", &default_base)),
             checkpoint_args: split(var(
@@ -84,8 +81,12 @@ impl ContainerSettings {
         self.base_dir.join("work")
     }
 
+    /// Local capture dirs (snapshot, fork, pause without an artifact root).
+    /// They live under the node's managed snapshot base so the OverlayBD
+    /// restack treats their layers as runtime-owned: a later capture adopts
+    /// (hard-links) them, and every capture dir stays self-contained.
     pub(super) fn snapshot_root(&self) -> PathBuf {
-        self.base_dir.join("snapshots")
+        crate::sandbox::firecracker::managed_snapshot_base().join("container")
     }
 
     pub(super) fn support_dir(&self) -> PathBuf {
@@ -130,9 +131,39 @@ pub(super) async fn run_in_netns(netns: &Path, args: &[&str]) -> Result<String> 
 pub(super) async fn runc(args: &[&str]) -> Result<String> {
     let settings = ContainerSettings::global();
     let root = settings.runc_root.display().to_string();
-    let mut full = vec!["--root", root.as_str(), "--criu", settings.criu.as_str()];
+    let mut full = vec!["--root", root.as_str()];
     full.extend_from_slice(args);
     run(&settings.runc, &full).await
+}
+
+/// Run `runc run|restore --detach`. The container inherits the caller's stdio,
+/// so it gets `/dev/null` (a host pipe or file would also be unrestorable by
+/// CRIU); runc's own errors go to `log`.
+pub(super) async fn runc_detached(args: &[&str], log: &Path) -> Result<()> {
+    let settings = ContainerSettings::global();
+    let root = settings.runc_root.display().to_string();
+    let log_arg = log.display().to_string();
+    let mut full = vec!["--root", root.as_str(), "--log", log_arg.as_str()];
+    full.extend_from_slice(args);
+    debug!(?full, "container backend detached runc");
+    let status = Command::new(&settings.runc)
+        .args(&full)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .context("spawn runc")?;
+    if !status.success() {
+        let log_text = tokio::fs::read_to_string(log).await.unwrap_or_default();
+        let tail: Vec<&str> = log_text.lines().rev().take(8).collect();
+        bail!(
+            "runc {} failed ({status}): {}",
+            args.first().copied().unwrap_or_default(),
+            tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+        );
+    }
+    Ok(())
 }
 
 // ── Network ─────────────────────────────────────────────────────────────────
@@ -272,6 +303,21 @@ pub(super) async fn tools_agentenv_dir(version: &str) -> Result<PathBuf> {
     Ok(target.join("agentenv"))
 }
 
+/// Unmount the node's tools-drive mounts and release their ublk devices.
+/// Called at server shutdown, before the ublk daemon stops: a mounted device
+/// would otherwise keep the daemon from deleting it.
+pub(crate) async fn shutdown() {
+    let mut mounts = TOOLS_MOUNTS.lock().await;
+    for (version, (device, path)) in mounts.drain() {
+        if let Err(error) = umount(&path).await {
+            warn!(%error, %version, "failed to unmount tools drive");
+        }
+        if let Err(error) = device.release().await {
+            warn!(%error, %version, "failed to release tools drive device");
+        }
+    }
+}
+
 // ── Container init and OCI spec ─────────────────────────────────────────────
 
 /// PID 1 inside the container: the container counterpart of the tools drive's
@@ -295,6 +341,8 @@ fi
 $BB cat > /run/sv/envd/run << 'RUNSV_EOF'
 #!/agentenv/bin/busybox sh
 exec 2>>/var/log/agentenv/envd.stderr.log
+# CRIU cannot checkpoint MPTCP sockets, which Go enables by default for listeners.
+export GODEBUG=multipathtcp=0
 exec /agentenv/envd
 RUNSV_EOF
 $BB cat > /run/sv/envd/log/run << 'RUNSV_EOF'
@@ -303,7 +351,10 @@ exec /agentenv/bin/busybox svlogd -tt /var/log/agentenv/envd
 RUNSV_EOF
 $BB chmod 0755 /run/sv/envd/run /run/sv/envd/log/run
 echo "AGENTENV CONTAINER INIT $($BB date -u +%FT%TZ)" >> /var/log/agentenv/container-init.log
-exec $BB runsvdir -P /run/sv
+$BB runsv /run/sv/envd >/var/log/agentenv/envd-sv.log 2>&1 &
+# PID 1 must reap orphans: runsvdir waits on any child. Its scan dir stays empty.
+$BB mkdir -p /run/agentenv-reaper
+exec $BB runsvdir -P /run/agentenv-reaper
 "#;
 
 /// Write the node's support directory (init script) once.
@@ -425,6 +476,20 @@ pub(super) fn oci_spec(params: &SpecParams<'_>) -> Value {
                 {"type": "cgroup"},
                 {"type": "network", "path": format!("/run/netns/{}", params.guest_netns)}
             ],
+            // Checkpointability guard rails, applied to every process in the
+            // sandbox: CRIU cannot dump io_uring instances or MPTCP sockets, so
+            // refuse to create them (callers fall back, as under Docker's
+            // default profile, which also blocks io_uring).
+            "seccomp": {
+                "defaultAction": "SCMP_ACT_ALLOW",
+                "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"],
+                "syscalls": [
+                    {"names": ["io_uring_setup", "io_uring_enter", "io_uring_register"],
+                     "action": "SCMP_ACT_ERRNO", "errnoRet": 38u32},
+                    {"names": ["socket"], "action": "SCMP_ACT_ERRNO", "errnoRet": 93u32,
+                     "args": [{"index": 2u32, "value": 262u64, "op": "SCMP_CMP_EQ"}]}
+                ]
+            },
             "maskedPaths": [
                 "/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys", "/proc/latency_stats",
                 "/proc/timer_list", "/proc/timer_stats", "/proc/sched_debug", "/sys/firmware",

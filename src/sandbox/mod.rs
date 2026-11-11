@@ -38,7 +38,7 @@ pub use backend::{
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use container::{
-    fresh_backend_is_container, ContainerCheckpoint, ContainerLaunch, ContainerPausedState,
+    fresh_backend_is_container, shutdown_container_backend, ContainerCheckpoint, ContainerLaunch, ContainerPausedState,
     ContainerSandbox, ContainerSandboxFactory,
 };
 pub use envd::EnvdApi;

@@ -320,9 +320,13 @@ impl ContainerSandbox {
         match self.launch.checkpoint.clone() {
             None => {
                 runtime::prepare_fresh_rootfs(&rootfs, dns).await?;
-                runtime::runc(&[
-                    "run", "--detach", "--bundle", &bundle_arg, "--pid-file", &pid_file, &name,
-                ])
+                runtime::runc_detached(
+                    &[
+                        "run", "--detach", "--bundle", &bundle_arg, "--pid-file", &pid_file,
+                        &name,
+                    ],
+                    &self.work_dir.join("runc.log"),
+                )
                 .await
                 .context("runc run")?;
             }
@@ -353,7 +357,7 @@ impl ContainerSandbox {
                 args.extend(settings.restore_args.iter().map(String::as_str));
                 args.push(&name);
                 let restore_started = std::time::Instant::now();
-                runtime::runc(&args)
+                runtime::runc_detached(&args, &self.work_dir.join("runc.log"))
                     .await
                     .with_context(|| format!("runc restore (CRIU log: {work_arg}/restore.log)"))?;
                 info!(

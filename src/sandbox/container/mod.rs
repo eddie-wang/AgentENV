@@ -8,3 +8,8 @@ mod sandbox;
 
 pub use factory::{fresh_backend_is_container, ContainerSandboxFactory};
 pub use sandbox::{ContainerCheckpoint, ContainerLaunch, ContainerPausedState, ContainerSandbox};
+
+/// Release node-wide container backend resources (tools-drive mounts).
+pub async fn shutdown_container_backend() {
+    runtime::shutdown().await;
+}

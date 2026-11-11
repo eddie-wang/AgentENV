@@ -153,7 +153,7 @@ fn reconcile_disk_rate_limiter(
     Ok(Box::new(rl))
 }
 
-pub(super) fn managed_snapshot_base() -> PathBuf {
+pub(crate) fn managed_snapshot_base() -> PathBuf {
     ConfigManager::global_config()
         .firecracker
         .work_dir
