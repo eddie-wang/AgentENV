@@ -18,7 +18,7 @@ use super::runtime_support::{
     parse_firecracker_manifest, runtime_image_cache_key, RuntimeImageMaterializer,
 };
 use super::{
-    CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, ResolvedAttachedDrive,
+    CommittedAttachedDrive, CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, ResolvedAttachedDrive,
     RunnableSnapshot, RuntimeArtifactLease, SnapshotId, SnapshotRecord,
 };
 use crate::image::cache::OverlaybdLayerStore;
@@ -392,9 +392,29 @@ impl RepositoryRuntimeResolver {
         .await?;
 
         let managed_repo_blob_url = self.repository.managed_layers_repo_blob_url();
+        // A disk image built from a remote-backed image records this
+        // repository's own layers as external layers addressed by its URL.
+        // Resolving them as managed layers yields the same config unless the
+        // repository reads them from a node-local copy.
+        let layers = layers
+            .iter()
+            .map(|layer| match (layer, managed_repo_blob_url.as_deref()) {
+                (OverlaybdLayerRef::External(external), Some(url))
+                    if external.repo_blob_url.trim_end_matches('/')
+                        == url.trim_end_matches('/') =>
+                {
+                    OverlaybdLayerRef::Managed(ManagedLayer {
+                        digest: external.digest.clone(),
+                        size: external.size,
+                        uuid: None,
+                    })
+                }
+                _ => layer.clone(),
+            })
+            .collect::<Vec<_>>();
         self.image_materializer
             .materialize_image_config(
-                layers,
+                &layers,
                 destination,
                 label,
                 managed_repo_blob_url.as_deref(),

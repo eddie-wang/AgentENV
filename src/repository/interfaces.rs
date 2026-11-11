@@ -114,6 +114,12 @@ pub trait Repository: Send + Sync {
         unsupported("blob storage")
     }
 
+    /// [`Self::locate_blob`] for a managed layer of `size` bytes; a backend
+    /// with node-local copies does not use a copy of another size.
+    fn locate_layer(&self, key: &BlobKey, _size: u64) -> RepositoryResult<BlobLocation> {
+        self.locate_blob(key)
+    }
+
     /// Whether a blob is stored.
     async fn has_blob(&self, _key: &BlobKey) -> RepositoryResult<bool> {
         unsupported("blob storage")

@@ -82,7 +82,7 @@ pub(crate) fn managed_layer_config(
         digest: layer.digest.clone(),
         role,
     };
-    let file = match repository.locate_blob(&key)? {
+    let file = match repository.locate_layer(&key, layer.size)? {
         BlobLocation::Local(path) => path.display().to_string(),
         BlobLocation::Remote(_) => String::new(),
     };

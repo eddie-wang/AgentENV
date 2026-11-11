@@ -8,6 +8,7 @@ use anyhow::Result;
 use super::client::{OssClient, OssUploadArtifact};
 use super::config::NormalizedOssConfig;
 use super::documents;
+use super::mirror::LocalMirror;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
@@ -23,6 +24,7 @@ use crate::types::SnapshotId;
 pub(crate) struct OssRepository {
     client: Arc<OssClient>,
     policy: PublishPolicy,
+    mirror: Option<LocalMirror>,
 }
 
 impl OssRepository {
@@ -59,6 +61,20 @@ impl OssRepository {
                 compression: publish_compression.clone(),
                 image_storage: snapshot_image_storage,
             },
+            mirror: LocalMirror::from_env(),
+        }
+    }
+
+    /// The node-local mirror's copy of `key` if it has one, else its URL.
+    fn locate(&self, key: &BlobKey, size: Option<u64>) -> BlobLocation {
+        let object_key = key.path();
+        match self
+            .mirror
+            .as_ref()
+            .and_then(|mirror| mirror.locate(&object_key, size))
+        {
+            Some(path) => BlobLocation::Local(path),
+            None => BlobLocation::Remote(self.client.object_url(&object_key)),
         }
     }
 }
@@ -115,7 +131,11 @@ impl Repository for OssRepository {
     }
 
     fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
-        Ok(BlobLocation::Remote(self.client.object_url(&key.path())))
+        Ok(self.locate(key, None))
+    }
+
+    fn locate_layer(&self, key: &BlobKey, size: u64) -> RepositoryResult<BlobLocation> {
+        Ok(self.locate(key, Some(size)))
     }
 
     async fn has_blob(&self, key: &BlobKey) -> RepositoryResult<bool> {
@@ -230,6 +250,59 @@ mod tests {
         assert_eq!(
             repository.managed_layers_repo_blob_url().as_deref(),
             Some("s3://bucket/prefix/managed-layers")
+        );
+    }
+
+    #[test]
+    fn local_mirror_copies_are_read_in_place_and_others_by_url() {
+        let client = OssClient::new(
+            "bucket".to_string(),
+            "https://oss.example.com".to_string(),
+            "region".to_string(),
+            "prefix".to_string(),
+            CredentialSource::Anonymous,
+            None,
+        )
+        .expect("oss client");
+        let mut repository = OssRepository::new(
+            Arc::new(client),
+            SnapshotImageStoragePolicy::default(),
+            &SnapshotPublishCompressionConfig {
+                enabled: false,
+                algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Zstd,
+                workers: 1,
+            },
+        );
+        let mirror = tempfile::tempdir().expect("tempdir");
+        repository.mirror = Some(LocalMirror::new(mirror.path().to_path_buf()));
+        let id = SnapshotId::generate();
+        let vm_state = BlobKey::Snapshot(id.clone(), SnapshotFile::VmState);
+        let manifest = BlobKey::Snapshot(id, SnapshotFile::FirecrackerManifest);
+        let layer = BlobKey::Layer {
+            digest: "sha256:aa".to_string(),
+            role: LayerRole::Memory,
+        };
+        for key in [&vm_state, &layer] {
+            let path = mirror.path().join(key.path());
+            std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+            std::fs::write(path, b"four").expect("write");
+        }
+
+        assert_eq!(
+            repository.locate_blob(&vm_state).unwrap(),
+            BlobLocation::Local(mirror.path().join(vm_state.path()))
+        );
+        assert_eq!(
+            repository.locate_blob(&manifest).unwrap(),
+            BlobLocation::Remote(format!("s3://bucket/prefix/{}", manifest.path()))
+        );
+        assert_eq!(
+            repository.locate_layer(&layer, 4).unwrap(),
+            BlobLocation::Local(mirror.path().join("managed-layers/sha256:aa"))
+        );
+        assert_eq!(
+            repository.locate_layer(&layer, 5).unwrap(),
+            BlobLocation::Remote("s3://bucket/prefix/managed-layers/sha256:aa".to_string())
         );
     }
 }

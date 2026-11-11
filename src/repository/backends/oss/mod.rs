@@ -2,6 +2,7 @@ mod client;
 mod config;
 mod documents;
 mod lease;
+mod mirror;
 mod repository;
 
 pub(crate) use self::client::OssClient;
