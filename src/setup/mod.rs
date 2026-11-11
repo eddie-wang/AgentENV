@@ -118,7 +118,15 @@ pub async fn ensure_environment(
 
     // 2. Selected virtualization mode and /dev/kvm check.
     info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
-    kvm::check(config.virtualization_mode)?;
+    if let Err(error) = kvm::check(config.virtualization_mode) {
+        // A container-only node (AENV_SANDBOX_BACKEND=container) needs no KVM:
+        // it still serves container sandboxes; microVM launches fail at spawn.
+        if crate::sandbox::fresh_backend_is_container() {
+            tracing::warn!(error = %format_args!("{error:#}"), "KVM unavailable; container-only node (microVM sandboxes will fail)");
+        } else {
+            return Err(error);
+        }
+    }
 
     // 3. ublk setup
     info!("checking ublk module and permissions");

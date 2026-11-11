@@ -311,6 +311,17 @@ impl ContainerSandbox {
             tools_dir: &tools_dir,
             support_dir: &support_dir,
         });
+        let mut spec = spec;
+        if restoring {
+            // Restore-only CRIU options via runc's per-container config annotation
+            // (replaces /etc/criu/runc.conf for this restore). mntns-compat-mode avoids
+            // mount-v2 failing to copy bind-mount sharing when the node's mount
+            // namespace or propagation differs from the dumping node's.
+            let conf = self.work_dir.join("criu-restore.conf");
+            tokio::fs::write(&conf, "allow-uprobes\nmntns-compat-mode\n").await?;
+            spec["annotations"] =
+                serde_json::json!({"org.criu.config": conf.display().to_string()});
+        }
         let bundle = self.bundle_dir();
         runtime::write_bundle(&bundle, &spec).await?;
         let bundle_arg = bundle.display().to_string();
