@@ -25,14 +25,22 @@ Lifecycle mapping:
 - **fork(n)**: a local capture, then n restores;
 - **delete**: kill, unmount, release the device, give `tap0` back to the slot.
 
-### Backend dispatch
+### Backend selection (one node runs both)
 
-The node's factory (`src/sandbox/firecracker/factory.rs`) chooses the backend:
-- **image launches**: the container backend when `AENV_SANDBOX_BACKEND=container`, otherwise Firecracker;
-- **snapshots**: the backend named in the manifest, so `backend: "container"` restores as a container on any node (`KNOWN_BACKENDS` now includes `container`);
-- **paused states**: the backend that paused them.
+- **`POST /sandboxes-cold` takes `"backend": "firecracker" | "container"`.** If it's omitted, the node default applies: `AENV_SANDBOX_BACKEND`, normally `firecracker`. An unknown or unavailable backend returns 400 before any image work.
+- **Snapshots and templates** (`POST /sandboxes`) go to the backend named in the snapshot manifest (`backend: "container"` or `"firecracker"`).
+- **Forks and resumes** go to the backend that captured them.
+- **The server flag `--enable-container`** (or `AENV_ENABLE_CONTAINER=1`) turns the container backend on. Container requests fail with a clear error when it's off.
+- **Without KVM:** when the container backend is enabled, the node starts without KVM. The startup KVM check only warns, and the Firecracker pool prime is skipped. Every microVM operation checks KVM lazily (in `FirecrackerSandbox::build`: cold create, template or snapshot create, fork, resume, template build) and fails just that request. The server stays up and keeps serving containers. The check result is cached once KVM works.
 
-A single node therefore serves microVMs and containers side by side.
+Tested matrix (`scripts/node.sh`, with `MASK_KVM=1` simulating a host without KVM):
+
+| Node | cold `firecracker` | cold `container` | cold, no backend | microVM template | container template | server |
+|---|---|---|---|---|---|---|
+| KVM, `--enable-container` | 201, microVM | 201, container | 201, microVM | 201 | 201 | up; VMs and containers run side by side |
+| no KVM, `--enable-container` | 400 "microVM sandboxes are unavailable on this node: …" | 201 | 400 | 500 "… unavailable …" | 201 | up, `/health` 204, existing containers keep working |
+| no KVM, container off | — | — | — | — | — | refuses to start (stock behaviour) |
+| KVM, container off | 201 | 400 "container backend is not enabled …" | 201 | 201 | 500 "not enabled" | up |
 
 ### Checkpointability guard rails, learned the hard way
 
@@ -77,5 +85,6 @@ The node server runs as root (runc, CRIU, mounts). `criu` must be on root's PATH
 - There are no volumes or attached drives in container mode.
 - Restore is eager: each copy holds its full private heap and nothing is shared. Lazy pages and page sharing are open.
 - The CRIU archive is one uncompressed tar per snapshot.
-- The backend choice for image launches is node-wide. A mixed cluster needs a per-request backend and capability-aware placement.
+- The scheduler doesn't know backends. In a cluster where some nodes have no KVM, placement needs capability filtering: nodes report `kvm` / `container`, and the gateway passes the request's backend in the scheduling hint. Until then, keep node pools uniform.
+- A microVM request on a node without KVM fails with 400 (cold create) or 500 (template); it isn't retried on another node.
 - Containers share the host kernel and run as root with Docker's default capabilities plus `SYS_PTRACE`, under an allow-by-default seccomp profile, with no user namespace. Secure sandboxes (`secure: true`, envd access tokens across restore) are untested.

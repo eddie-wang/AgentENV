@@ -21,9 +21,10 @@ start)
   extra=(); [ -n "${SCHED:-}" ] && extra=(AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=$SCHED)
   sudo env API_ADDR=$addr AENV_CONFIG_PATH=$CT/nodes/$name/config.toml AENV_HOME_PATH=$home \
     AENV_RUNTIME_PATH=/run/aenv-$name AENV_VIRTUALIZATION_MODE=kvm HOME=/root AENV_NODE_ID=$name \
-    AENV_SANDBOX_BACKEND=${AENV_SANDBOX_BACKEND:-container} AENV_CT_BASE_DIR=$home/container \
+    AENV_SANDBOX_BACKEND=${AENV_SANDBOX_BACKEND:-firecracker} AENV_ENABLE_CONTAINER=${AENV_ENABLE_CONTAINER:-1} \
+    AENV_CT_BASE_DIR=$home/container \
     AENV_CT_RUNC_ROOT=/run/aenv-ct-$name/runc RUST_LOG=${RUST_LOG:-info,netlink_packet_route=error} "${extra[@]}" \
-    setsid nohup "${wrap[@]}" $bin > $log 2>&1 < /dev/null &
+    setsid nohup "${wrap[@]}" $bin >> $log 2>&1 < /dev/null &
   for i in $(seq 120); do curl -s -o /dev/null -w '%{http_code}' http://$addr/health 2>/dev/null | grep -q 204 && { echo "node $name up on $addr after ${i}s"; exit 0; }; sleep 1; done
   echo "node $name not healthy"; tail -20 $log; exit 1;;
 stop)
