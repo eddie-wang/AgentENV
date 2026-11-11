@@ -175,6 +175,17 @@ impl OssClient {
 
     /// Read a small object entirely into memory.
     pub(crate) async fn get_bytes(&self, key: &str) -> Result<Bytes> {
+        if let Some(bytes) = read_cache::get(key) {
+            return Ok(bytes);
+        }
+        let result = self.get_bytes_uncached(key).await;
+        if let Ok(bytes) = &result {
+            read_cache::put(key, bytes);
+        }
+        result
+    }
+
+    async fn get_bytes_uncached(&self, key: &str) -> Result<Bytes> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "get_bytes");
         let result = self
             .run_with_key(key, |operator, key| async move {
@@ -326,6 +337,7 @@ impl OssClient {
         data: impl Into<Bytes>,
         artifact: OssUploadArtifact,
     ) -> Result<()> {
+        read_cache::invalidate(key);
         let data = data.into();
         let size = data.len() as u64;
         let oss_key = self.full_key(key);
@@ -360,6 +372,7 @@ impl OssClient {
         data: impl Into<Bytes>,
         etag: Option<&str>,
     ) -> Result<bool> {
+        read_cache::invalidate(key);
         let data = data.into();
         let oss_key = self.full_key(key);
         self.run_with_operator(|operator| {
@@ -395,6 +408,7 @@ impl OssClient {
         artifact: OssUploadArtifact,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        read_cache::invalidate(key);
         let data = data.into();
         let size = data.len() as u64;
         let oss_key = self.full_key(key);
@@ -433,6 +447,7 @@ impl OssClient {
         key: &str,
         deadline: tokio::time::Instant,
     ) -> Result<()> {
+        read_cache::invalidate(key);
         let oss_key = self.full_key(key);
         self.run_with_cached(&self.single_attempt, |operator| {
             let oss_key = oss_key.clone();
@@ -497,6 +512,7 @@ impl OssClient {
         path: &Path,
         artifact: OssUploadArtifact,
     ) -> Result<()> {
+        read_cache::invalidate(key);
         let oss_key = self.full_key(key);
         let path = path.to_path_buf();
         let mut metric =
@@ -551,6 +567,7 @@ impl OssClient {
 
     /// Delete a single object. Idempotent – missing objects are not errors.
     pub(crate) async fn delete(&self, key: &str) -> Result<()> {
+        read_cache::invalidate(key);
         self.run_with_key(key, |operator, key| async move {
             match operator.delete(&key).await {
                 Ok(()) => Ok(()),
@@ -564,6 +581,7 @@ impl OssClient {
 
     /// Delete all objects under a prefix.
     pub(crate) async fn delete_prefix(&self, prefix: &str) -> Result<()> {
+        read_cache::invalidate_prefix(prefix);
         // `list_keys_recursive()` returns repository-relative keys with the
         // configured backend prefix stripped, while `delete()` expects that
         // same repository-relative form and re-applies the backend prefix.
@@ -839,5 +857,73 @@ mod tests {
             Some(AddressingStyle::Virtual),
         )
         .expect_err("malformed endpoint must fail even with an explicit override");
+    }
+}
+
+/// Node-local TTL cache of small, effectively immutable catalog reads that every create repeats
+/// (snapshot alias → catalog record → firecracker manifest). Enabled by `AENV_OSS_READ_CACHE_TTL_SECS` > 0
+/// (default 0 = off, stock behaviour). Only successful reads are cached; any write or delete of a key through this
+/// client drops it. A rebind or delete made by another node is seen after at most the TTL.
+mod read_cache {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use bytes::Bytes;
+
+    fn ttl() -> Duration {
+        static TTL: OnceLock<Duration> = OnceLock::new();
+        *TTL.get_or_init(|| {
+            Duration::from_secs(
+                std::env::var("AENV_OSS_READ_CACHE_TTL_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0),
+            )
+        })
+    }
+
+    fn cacheable(key: &str) -> bool {
+        key.starts_with("catalog/aliases/")
+            || key.starts_with("catalog/records/")
+            || (key.starts_with("artifacts/") && key.ends_with("/firecracker-manifest.json"))
+    }
+
+    fn map() -> &'static Mutex<HashMap<String, (Instant, Bytes)>> {
+        static MAP: OnceLock<Mutex<HashMap<String, (Instant, Bytes)>>> = OnceLock::new();
+        MAP.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn get(key: &str) -> Option<Bytes> {
+        if ttl().is_zero() || !cacheable(key) {
+            return None;
+        }
+        let mut map = map().lock().unwrap();
+        match map.get(key) {
+            Some((at, bytes)) if at.elapsed() < ttl() => Some(bytes.clone()),
+            Some(_) => {
+                map.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub(super) fn put(key: &str, bytes: &Bytes) {
+        if !ttl().is_zero() && cacheable(key) {
+            map().lock().unwrap().insert(key.to_owned(), (Instant::now(), bytes.clone()));
+        }
+    }
+
+    pub(super) fn invalidate(key: &str) {
+        if !ttl().is_zero() {
+            map().lock().unwrap().remove(key);
+        }
+    }
+
+    pub(super) fn invalidate_prefix(prefix: &str) {
+        if !ttl().is_zero() {
+            map().lock().unwrap().retain(|k, _| !k.starts_with(prefix));
+        }
     }
 }
