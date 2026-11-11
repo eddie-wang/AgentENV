@@ -13,6 +13,11 @@ start)
   sudo modprobe ublk_drv
   bin=${SERVER_BIN:-$POC/../../target/release/server}
   wrap=(); [ -n "${NETNS:-}" ] && wrap=(nsenter --net=/run/netns/$NETNS)
+  # MASK_KVM=1: run the node in a private mount namespace where /dev/kvm is unusable (simulates a host without KVM).
+  if [ -n "${MASK_KVM:-}" ]; then
+    sudo mkdir -p /run/nokvm && sudo touch /run/nokvm/kvm
+    wrap=(unshare -m --propagation private sh -c 'mount --bind /run/nokvm/kvm /dev/kvm && mount -o remount,ro,bind /dev/kvm && exec "$@"' sh "${wrap[@]}")
+  fi
   extra=(); [ -n "${SCHED:-}" ] && extra=(AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=$SCHED)
   sudo env API_ADDR=$addr AENV_CONFIG_PATH=$CT/nodes/$name/config.toml AENV_HOME_PATH=$home \
     AENV_RUNTIME_PATH=/run/aenv-$name AENV_VIRTUALIZATION_MODE=kvm HOME=/root AENV_NODE_ID=$name \
