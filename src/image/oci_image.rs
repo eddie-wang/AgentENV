@@ -226,6 +226,23 @@ const MAX_INDEX_RESOLUTION_DEPTH: usize = 4;
 /// VM sees this as the rootfs device capacity; actual storage is only what the
 /// layers contain. 64 GiB comfortably covers common base images.
 pub(super) const LAYER_VIRTUAL_SIZE_GIB: u64 = 64;
+/// Virtual size of converted *user* image layers (not the tools image, whose v1 contract stays at
+/// [`LAYER_VIRTUAL_SIZE_GIB`]). `AENV_LAYER_VIRTUAL_SIZE_GIB` overrides it (64..=4096, a multiple of 64), e.g. 256
+/// for read-only seed volumes over 64 GiB. The value is part of the layer conversion cache key, so layers converted
+/// at another size are never reused for it.
+pub(super) fn user_layer_virtual_size_gib(converter_id: &str) -> u64 {
+    if converter_id.starts_with("tools-") {
+        return LAYER_VIRTUAL_SIZE_GIB;
+    }
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("AENV_LAYER_VIRTUAL_SIZE_GIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| (64..=4096).contains(v) && v % 64 == 0)
+            .unwrap_or(LAYER_VIRTUAL_SIZE_GIB)
+    })
+}
 const OCI_INDEX_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
@@ -472,7 +489,7 @@ pub(crate) async fn convert_fetched_oci_image_to_overlaybd(
             let converter = OverlaybdLayerConverter {
                 tools: OverlaybdTools::from_overlaybd_install_root(conversion.install_root),
                 global_config_path: conversion.global_config.to_path_buf(),
-                virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
+                virtual_size_gib: user_layer_virtual_size_gib(conversion.converter_id),
             };
             let lowers = convert_standard_oci_layers_pipeline(
                 conversion.regctl_binary,
@@ -769,7 +786,7 @@ pub(super) async fn convert_content_image(
     let converter = OverlaybdLayerConverter {
         tools: OverlaybdTools::from_overlaybd_install_root(conversion.install_root),
         global_config_path: conversion.global_config.to_path_buf(),
-        virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
+        virtual_size_gib: user_layer_virtual_size_gib(conversion.converter_id),
     };
     let mut producer = ContentLayerSource {
         content,
@@ -1701,7 +1718,7 @@ fn layer_conversion_key(
     LayerConversionKey {
         source_layer_digest: layer.digest.clone(),
         converter_id: converter_id.to_string(),
-        virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
+        virtual_size_gib: user_layer_virtual_size_gib(converter_id),
         mkfs,
         parent_commit_digest: parent_commit_digest.map(str::to_string),
         expected_layer_uuid,
