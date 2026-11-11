@@ -544,6 +544,13 @@ impl VolumeManager {
         reference: &str,
     ) -> Result<VolumeRecord, VolumeError> {
         let mut parent = self.get(reference).await?;
+        // A read-only volume's committed layers are its whole, immutable content,
+        // so the snapshot references them as-is. Re-deriving them from the
+        // node-local config is not a round trip: on OSS a materialized managed
+        // lower reads back as an external layer, which the catalog rejects.
+        if parent.mode == VolumeMode::ReadOnly {
+            return Ok(parent);
+        }
         // A running sandbox restacks its volume upper into this same local
         // image config before capture. Publish that latest state before making
         // the logical volume snapshot.
@@ -940,11 +947,18 @@ fn validate_volume_id(id: &str) -> Result<(), VolumeError> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
+    use async_trait::async_trait;
     use overlaybd::config::{ImageConfig, LayerConfig};
+    use tempfile::NamedTempFile;
 
     use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
     use crate::digest::sha256_digest;
+    use crate::repository::{
+        BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
+        Repository, RepositoryResult,
+    };
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
 
@@ -1235,6 +1249,107 @@ mod tests {
                 }
             );
         }
+    }
+
+    const REMOTE_MANAGED_LAYERS_URL: &str = "s3://bucket/prefix/managed-layers";
+
+    /// Stores through the POSIX backend but addresses managed layers by URL, as
+    /// the OSS backend does, so materialized volume configs carry remote lowers.
+    struct RemoteManagedLayers {
+        inner: Arc<dyn Repository>,
+    }
+
+    #[async_trait]
+    impl Repository for RemoteManagedLayers {
+        fn managed_layers_repo_blob_url(&self) -> Option<String> {
+            Some(REMOTE_MANAGED_LAYERS_URL.to_owned())
+        }
+
+        async fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
+            self.inner.put_blob(key, body).await
+        }
+
+        fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
+            Ok(BlobLocation::Remote(format!("{REMOTE_MANAGED_LAYERS_URL}/{}", key.path())))
+        }
+
+        fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
+            self.inner.staging_file()
+        }
+
+        async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+            self.inner.get_document(key).await
+        }
+
+        async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+            self.inner.put_document(key, bytes).await
+        }
+
+        async fn update_document(
+            &self,
+            key: DocumentKey,
+            update: DocumentUpdate,
+        ) -> RepositoryResult<Option<Vec<u8>>> {
+            self.inner.update_document(key, update).await
+        }
+
+        async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
+            self.inner.delete_document(key).await
+        }
+
+        async fn list_documents(
+            &self,
+            collection: DocumentCollection,
+            after: Option<&str>,
+            limit: usize,
+        ) -> RepositoryResult<Vec<String>> {
+            self.inner.list_documents(collection, after, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_clone_snapshot_keeps_committed_layers_with_remote_managed_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: temp.path().join("repository"),
+            cache_root: Some(temp.path().join("cache")),
+            runtime_cache_root: Some(temp.path().join("runtime")),
+        })
+        .expect("POSIX snapshot backend");
+        let repository: Arc<dyn Repository> = Arc::new(RemoteManagedLayers {
+            inner: backend.repository(),
+        });
+        let manager =
+            VolumeManager::open_with_repository(temp.path().join("volumes/catalog"), repository)
+                .await
+                .expect("volume manager");
+        let parent = published_volume(temp.path(), &manager).await;
+        assert!(matches!(parent.backing_layers[0], OverlaybdLayerRef::Managed(_)));
+        let seed = manager
+            .create(
+                "seed-ro".to_owned(),
+                VolumeMode::ReadOnly,
+                Some(parent.id.clone()),
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
+        manager.reserve(&seed.id, "sandbox").await.unwrap();
+        let mounted = manager.materialize_backing(&seed.id).await.unwrap();
+        let config =
+            overlaybd::config::load_image_config(mounted.backing_image_config.as_ref().unwrap())
+                .unwrap();
+        assert!(config.lowers[0].file.is_empty());
+        assert_eq!(config.lowers[0].repo_blob_url, REMOTE_MANAGED_LAYERS_URL);
+
+        let captured = manager.snapshot_volume_state(&seed.id).await.unwrap();
+
+        assert_eq!(captured.backing_layers, parent.backing_layers);
+        let stored = manager.get(&seed.id).await.unwrap();
+        assert_eq!(stored.backing_layers, parent.backing_layers);
+        assert_eq!(stored.status, VolumeStatus::Ready);
+        assert_eq!(stored.read_only_mounts, vec!["sandbox".to_owned()]);
     }
 
     #[tokio::test]
