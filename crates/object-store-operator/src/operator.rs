@@ -94,6 +94,13 @@ pub fn build_object_store_operator(
 
     let timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT);
     let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
+    // AENV_OBJECT_STORE_TRACE=1 logs every OpenDAL operation (per attempt, inside the retry layer) to stderr
+    // as `OBJSTORE <unix_ms> <service> <op> <message> <context>`. Off by default.
+    let operator = if std::env::var("AENV_OBJECT_STORE_TRACE").as_deref() == Ok("1") {
+        operator.layer(opendal::layers::LoggingLayer::new(ObjectStoreTrace))
+    } else {
+        operator
+    };
     Ok(operator
         .layer(
             TimeoutLayer::new()
@@ -194,5 +201,34 @@ mod tests {
     fn addressing_style_maps_to_expected_s3_modes() {
         assert!(AddressingStyle::Virtual.uses_virtual_host_style());
         assert!(!AddressingStyle::Path.uses_virtual_host_style());
+    }
+}
+
+/// Stderr trace of every object-store operation (see `build_object_store_operator`).
+#[derive(Debug, Clone, Copy)]
+struct ObjectStoreTrace;
+
+impl opendal::layers::LoggingInterceptor for ObjectStoreTrace {
+    fn log(
+        &self,
+        info: &opendal::raw::AccessorInfo,
+        operation: opendal::raw::Operation,
+        context: &[(&str, &str)],
+        message: &str,
+        err: Option<&opendal::Error>,
+    ) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let ctx: Vec<String> = context.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let err = err.map(|e| format!(" err={:?}", e.kind())).unwrap_or_default();
+        eprintln!(
+            "OBJSTORE {ms} {} {} {} {}{err}",
+            info.scheme(),
+            operation.into_static(),
+            message.replace(' ', "_"),
+            ctx.join(" ")
+        );
     }
 }
