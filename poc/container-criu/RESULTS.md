@@ -41,5 +41,16 @@ Reading the numbers:
 - **On demand, the gain is cancelled out.** Eager CRIU restore costs about 2.8 s at 10 concurrent, versus 0.09 s for a microVM snapshot restore, and teardown is 0.6 s slower. Makespans are equal within ±1%.
 - **With a pre-warmed pool, the container is about 9% faster** (215.5 vs 236.8 s).
 - The comparison runs on bare metal with 4 KiB pages, which is the microVM's best case. On nested-virtualization hosts the microVM is much slower without huge pages, so the container's lead would likely be larger there.
-- Memory was not measured. A CRIU copy holds its full private heap (about 5 GB here), while microVM clones share the template's pages.
 - The app's search tools ran without their embedding backend, in both arms.
+
+## Memory: 10 sandboxes from the template, microVM vs container
+
+Same node, page cache dropped before each arm. The host delta is `MemTotal - MemAvailable` against the arm's baseline (reclaimable page cache excluded). "Busy" is measured after each sandbox replayed one recorded rollout, with the sandboxes still alive.
+
+| | microVM | container |
+|---|---|---|
+| Idle, just restored | **+2.05 GiB (0.21 per sandbox)**; PSS 1.95 GiB (template pages shared) | **+41.2 GiB (4.1 per sandbox)**: the full checkpointed heap (4.07 GiB) copied into each sandbox |
+| After 1 rollout each | **+25.9 GiB (2.6 per sandbox)** | **+42.2 GiB (4.2 per sandbox)** |
+| Wall time of those 10 rollouts | 37.0 s | 28.8 s |
+
+Restored containers cost about 20× more memory while idle and about 1.6× after a short rollout. MicroVM clones converge toward the container figure as the app rewrites its heap. Closing this gap needs lazy, shared memory restore; see the README's limitations.
